@@ -70,9 +70,15 @@ _bits_per_pixel[6] = {8:32, 16:64}
 
 class IHDR():
     @classmethod
-    def from_buffer(cls, buf):
+    def create(cls, width, height, bitdepth, colortype, compression, filtermethod, interlace):
         new = cls()
-        new.width, new.height, new.bitdepth, new.colortype, new.compression, new.filtermethod, new.interlace = struct.unpack(">IIBBBBB", buf)
+        new.width = width
+        new.height = height
+        new.bitdepth = bitdepth
+        new.colortype = colortype
+        new.compression = compression
+        new.filtermethod = filtermethod
+        new.interlace = interlace
         assert new.width>0, "ERROR: width must be positive"
         assert new.height>0, "ERROR: height must be positive"
         assert new.colortype in set([0, 2, 3, 4, 6]), "ERROR: {} is not a valid colortype".format(new.colortype)
@@ -91,6 +97,12 @@ class IHDR():
         assert new.interlace in set([0, 1]), "ERROR: {} is not a valid interlace method".format(new.interlace)
         new.bytes_per_pixel = bits_to_bytes(_bits_per_pixel[new.colortype][new.bitdepth])
         new.width_bytes = bits_to_bytes(new.width*_bits_per_pixel[new.colortype][new.bitdepth])
+        return new
+
+    @classmethod
+    def from_buffer(cls, buf):
+        width, height, bitdepth, colortype, compression, filtermethod, interlace = struct.unpack(">IIBBBBB", buf)
+        new = cls.create(width, height, bitdepth, colortype, compression, filtermethod, interlace)
         return new
     
     def __repr__(self):
