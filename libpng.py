@@ -283,19 +283,21 @@ class PNG():
         assert new.chunks[0].type == b'IHDR', "ERROR: first chunk must be of type IHDR, {} type chunk found".format(new.chunks[0].type)
         count = sum(chunk.type==b'IHDR' for chunk in new.chunks)
         assert count==1, "ERROR: there must be exactly 1 IHDR chunk, found {}".format(count)
-        assert new.chunks[-1].type == b'IEND', "ERROR: last chunk must be of type IEND, {} type chunk found".format(new.chunks[-1].type)
+        if new.chunks[-1].type != b'IEND':
+             print("ERROR: last chunk must be of type IEND, {} type chunk found".format(new.chunks[-1].type))
         count = sum(chunk.type==b'IEND' for chunk in new.chunks)
-        assert count==1, "ERROR: there must be exactly 1 IEND chunk, found {}".format(count)
+        if count!=1:
+            print("ERROR: there must be exactly 1 IEND chunk, found {}".format(count))
 
         new.ihdr = IHDR.from_buffer(new.chunks[0].body)
-        if new.ihdr.colortype==3:
-            raise NotImplementedError("color type 3")
+        try:
+            new.data = zlib.decompress(_merge_data(new.chunks))
+        except zlib.error:
+            print("ERROR: zlib.decompress failed")
+            return new
+
         if new.ihdr.interlace:
-            raise NotImplementedError("adam7 interlacing")
-        
-        new.data = zlib.decompress(_merge_data(new.chunks))
-        if new.ihdr.colortype==3:
-            print("support for colour type 3 is not yet implemented")
+            print("support for adam7 interlacing is not yet implemented")
             return new
 
         actual_dim, supposed_dim = len(new.data), new.ihdr.width*new.ihdr.height*new.ihdr.bytes_per_pixel+new.ihdr.height
@@ -303,6 +305,8 @@ class PNG():
             print("WARNING: too many pixels")
         elif actual_dim<supposed_dim:
             print("ERROR: too few pixels")
+            print("expected:\n\t{}x{}x{} = {}".format(new.ihdr.width, new.ihdr.height, new.ihdr.bytes_per_pixel, supposed_dim))
+            print("found:\n\t{}".format(actual_dim))
             raise ValueError
 
         try:
@@ -311,6 +315,13 @@ class PNG():
             print(e)
         except ValueError as e:
             pass
+        if new.ihdr.colortype==3:
+            _ = [chunk for chunk in new.chunks if chunk.type==b'PLTE']
+            if len(_)>1:
+                print("WARNING: there should only be 1 PLTE chunk, {} found.".format(len(_)))
+                return new
+            new.plte, *_ = _
+            new.pixels = [new.plte[x] for x in new.pixels]
         return new
     
     @classmethod
@@ -318,8 +329,12 @@ class PNG():
         """read file as a PNG image"""
         with open(name, "rb") as f:
             return cls.from_buffer(f.read())
+
+    def get_filter_bytes(self):
+        assert self.ihdr.interlace==0, "ERROR: can't deal with adam7 yet"
+        return self.data[::self.ihdr.width*self.ihdr.bytes_per_pixel+1]
     
-    def rebuild_chunks(self, filtermethod=None, update_ihdr=True):
+    def rebuild_chunks(self, filtermethod=None, update_ihdr=True, compression_level=9):
         """
         build a new chunk list from pixel data.
         needs to be called, when pixel data was modified, 
@@ -333,7 +348,7 @@ class PNG():
         if filtermethod == None:
             filtermethod = cycle((0,))
         data = apply_filter(self.pixels, self.ihdr.width_bytes, self.ihdr.bytes_per_pixel, filtermethod) 
-        for chunk in group(zlib.compress(data), 8192):
+        for chunk in group(zlib.compress(data, compression_level), 8192):
             c = Chunk()
             c.type = b"IDAT"
             c.body = chunk
