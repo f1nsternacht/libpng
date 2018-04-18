@@ -19,14 +19,14 @@ class Chunk():
         if not new.valid:
             print("WARNING: crc failed")
         return new
-    
+
     def total(self):
         """return length including type-, length- and checksum fields"""
         return len(self.body)+12
 
     def __repr__(self):
         return "Chunk[{}]:{}".format(str(self.type), self.total())
-    
+
     def to_bytes(self, recalculate_crc=True):
         """turn Chunk back into bytes
         length and checksum are calculated appropriately"""
@@ -101,10 +101,11 @@ class IHDR():
 
     @classmethod
     def from_buffer(cls, buf):
+        assert len(buf) == struct.calcsize(">IIBBBBB"), "IHDR too large?"
         width, height, bitdepth, colortype, compression, filtermethod, interlace = struct.unpack(">IIBBBBB", buf)
         new = cls.create(width, height, bitdepth, colortype, compression, filtermethod, interlace)
         return new
-    
+
     def __repr__(self):
         data = [("width", self.width), ("height", self.height), ("bitdepth", self.bitdepth), ("colortype", self.colortype), ("compression", self.compression), ("filtermethod", self.filtermethod), ("interlace", self.interlace)]
         return '\n'.join("{:d} : {:s}".format(y, x) for x, y in data)
@@ -114,7 +115,7 @@ class IHDR():
         c.type = b'IHDR'
         c.body = struct.pack(">IIBBBBB", self.width, self.height, self.bitdepth, self.colortype, self.compression, self.filtermethod, self.interlace)
         return c
-        
+
 
 def group(seq, n):
     while seq:
@@ -122,6 +123,9 @@ def group(seq, n):
         seq = seq[n:]
 
 def split_to_chunks(data, size):
+    """
+    split encoded image data into IDAT chunks of given size
+    """
     out = []
     for i in range(0, len(data), size):
         c = Chunk()
@@ -140,10 +144,10 @@ def restore_from_filter(pixels, width, bytes_per_pixel):
             old.appendleft(new)
         out = bytes(out)
         return out
-    
+
     def filter_up(line, prev):
         return b''.join(bytes(((a+b)&0xff,)) for a, b in zip(line, prev))
-    
+
     def filter_avg(line, prev):
         out = []
         old = deque(0 for _ in range(bytes_per_pixel))
@@ -151,7 +155,7 @@ def restore_from_filter(pixels, width, bytes_per_pixel):
             out += [(x+(b+old.pop())//2)&0xff]
             old.appendleft(out[-1])
         return bytes(out)
-    
+
     def filter_paeth(line, prev):
         out = b''
         old = deque(0 for _ in range(bytes_per_pixel))
@@ -173,7 +177,7 @@ def restore_from_filter(pixels, width, bytes_per_pixel):
             old.appendleft(out[-1])
             old_up.appendleft(b)
         return out
-    
+
     out = b""
     prev = b"\x00"*width
     for line in group(pixels, width+1):
@@ -270,16 +274,16 @@ def _merge_data(chunks):
 
 class PNG():
     MAGIC = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a"
-    
+
     @classmethod
-    def from_buffer(cls, buf):
+    def from_buffer(cls, buf, just_header=False):
         """interpret content of buffer as PNG image"""
         new = cls()
         assert len(cls.MAGIC) + 12 < len(buf), "ERROR: buffer too short"
         assert buf[:len(cls.MAGIC)]==cls.MAGIC, "ERROR: magic bytes mismatched"
-        
+
         new.chunks = _parse_chunks(buf[len(cls.MAGIC):])
-        
+
         assert new.chunks[0].type == b'IHDR', "ERROR: first chunk must be of type IHDR, {} type chunk found".format(new.chunks[0].type)
         count = sum(chunk.type==b'IHDR' for chunk in new.chunks)
         assert count==1, "ERROR: there must be exactly 1 IHDR chunk, found {}".format(count)
@@ -289,20 +293,33 @@ class PNG():
         if count!=1:
             print("ERROR: there must be exactly 1 IEND chunk, found {}".format(count))
 
-        new.ihdr = IHDR.from_buffer(new.chunks[0].body)
+        try:
+            new.ihdr = IHDR.from_buffer(new.chunks[0].body)
+        except AssertionError as e:
+            print(e)
+            return new
+
+        if new.ihdr.colortype==3:
+            print("Color Type 3 is currently not supported")
+            return new
+        if new.ihdr.interlace:
+            print("adam7 interlacing is currently not supported")
+            return new
+
+        if just_header:
+            return new
+
         try:
             new.data = zlib.decompress(_merge_data(new.chunks))
         except zlib.error:
             print("ERROR: zlib.decompress failed")
             return new
 
-        if new.ihdr.interlace:
-            print("support for adam7 interlacing is not yet implemented")
-            return new
-
         actual_dim, supposed_dim = len(new.data), new.ihdr.width*new.ihdr.height*new.ihdr.bytes_per_pixel+new.ihdr.height
         if actual_dim>supposed_dim:
             print("WARNING: too many pixels")
+            print("expected:\n\t{}x{}x{} = {}".format(new.ihdr.width, new.ihdr.height, new.ihdr.bytes_per_pixel, supposed_dim))
+            print("found:\n\t{}".format(actual_dim))
         elif actual_dim<supposed_dim:
             print("ERROR: too few pixels")
             print("expected:\n\t{}x{}x{} = {}".format(new.ihdr.width, new.ihdr.height, new.ihdr.bytes_per_pixel, supposed_dim))
@@ -323,40 +340,43 @@ class PNG():
             new.plte, *_ = _
             new.pixels = [new.plte[x] for x in new.pixels]
         return new
-    
+
     @classmethod
-    def from_file(cls, name):
+    def from_file(cls, name, just_header=False):
         """read file as a PNG image"""
         with open(name, "rb") as f:
-            return cls.from_buffer(f.read())
+            return cls.from_buffer(f.read(), just_header)
 
     def get_filter_bytes(self):
         assert self.ihdr.interlace==0, "ERROR: can't deal with adam7 yet"
         return self.data[::self.ihdr.width*self.ihdr.bytes_per_pixel+1]
-    
+
+    def get_chunks_by_type(self, type):
+        return [chunk for chunk in self.chunks if chunk.type==type]
+
     def rebuild_chunks(self, filtermethod=None, update_ihdr=True, compression_level=9):
         """
         build a new chunk list from pixel data.
-        needs to be called, when pixel data was modified, 
+        needs to be called, when pixel data was modified,
         before the image is saved.
         """
         if update_ihdr:
             chunks = [self.ihdr.to_chunk()]
         else:
             chunks = [self.chunks[0]]
-        
+
         if filtermethod == None:
             filtermethod = cycle((0,))
-        data = apply_filter(self.pixels, self.ihdr.width_bytes, self.ihdr.bytes_per_pixel, filtermethod) 
+        data = apply_filter(self.pixels, self.ihdr.width_bytes, self.ihdr.bytes_per_pixel, filtermethod)
         for chunk in group(zlib.compress(data, compression_level), 8192):
             c = Chunk()
             c.type = b"IDAT"
             c.body = chunk
             chunks.append(c)
-        
+
         chunks += [self.chunks[-1]]
         self.chunks = chunks
-    
+
     def save(self, name, strip=False, compress=True, recalculate_crc=True):
         """
         write PNG to file
@@ -367,11 +387,14 @@ class PNG():
             buf += c.to_bytes(recalculate_crc)
         with open(name, "wb") as f:
             return f.write(buf)
-    
+
 
 if __name__=='__main__':
     import sys
-    _, source, target = sys.argv
-    img = PNG.from_file(source)
-    img.rebuild_chunks()
-    img.save(target)
+    try:
+        _, source, target = sys.argv
+        img = PNG.from_file(source)
+        img.rebuild_chunks()
+        img.save(target)
+    except ValueError:
+        pass
