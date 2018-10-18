@@ -16,8 +16,6 @@ class Chunk():
         new.body = buf[8:8+length]
         new.crc = struct.unpack(">I", buf[8+length:8+length+4])[0]
         new.valid = new.crc == crc32(new.type+new.body)
-        if not new.valid:
-            print("WARNING: crc failed")
         return new
 
     def total(self):
@@ -47,16 +45,18 @@ def _parse_chunks(s):
     while i<len(s):
         try:
             c = Chunk.from_buffer(s[i:])
+            if not c.valid:
+                print(i)
         except struct.error:
             print("WARNING: Orphan data after IEND")
-            break
+            return chunks, s[i:]
         chunks.append(c)
         i += c.total()
         if c.type==b'IEND':
             if i<len(s):
                 print("WARNING: Orphan data after IEND chunk")
-            break
-    return chunks
+                return chunks, s[i:]
+    return chunks, None
 
 def bits_to_bytes(x):
     return (x>>3) + ((x&7)>0)
@@ -107,8 +107,9 @@ class IHDR():
         return new
 
     def __repr__(self):
-        data = [("width", self.width), ("height", self.height), ("bitdepth", self.bitdepth), ("colortype", self.colortype), ("compression", self.compression), ("filtermethod", self.filtermethod), ("interlace", self.interlace)]
-        return '\n'.join("{:d} : {:s}".format(y, x) for x, y in data)
+        ctype = {0:'grayscale', 2:'RGB', 3:'palette', 4:'grayscale-alpha', 6:'RGBA'}
+        data = [("width", self.width), ("height", self.height), ("bitdepth", self.bitdepth), ("colortype", ctype[self.colortype]), ("compression", self.compression), ("filtermethod", self.filtermethod), ("interlace", self.interlace)]
+        return '\n'.join("{} : {}".format(y, x) for x, y in data)
 
     def to_chunk(self):
         c = Chunk()
@@ -282,7 +283,7 @@ class PNG():
         assert len(cls.MAGIC) + 12 < len(buf), "ERROR: buffer too short"
         assert buf[:len(cls.MAGIC)]==cls.MAGIC, "ERROR: magic bytes mismatched"
 
-        new.chunks = _parse_chunks(buf[len(cls.MAGIC):])
+        new.chunks, new.orphan = _parse_chunks(buf[len(cls.MAGIC):])
 
         assert new.chunks[0].type == b'IHDR', "ERROR: first chunk must be of type IHDR, {} type chunk found".format(new.chunks[0].type)
         count = sum(chunk.type==b'IHDR' for chunk in new.chunks)
@@ -299,9 +300,9 @@ class PNG():
             print(e)
             return new
 
-        if new.ihdr.colortype==3:
-            print("Color Type 3 is currently not supported")
-            return new
+        # ~ if new.ihdr.colortype==3:
+            # ~ print("Color Type 3 is currently not supported")
+            # ~ return new
         if new.ihdr.interlace:
             print("adam7 interlacing is currently not supported")
             return new
@@ -332,12 +333,15 @@ class PNG():
             print(e)
         except ValueError as e:
             pass
+        pltes = [chunk for chunk in new.chunks if chunk.type==b'PLTE']
+        if new.ihdr.colortype!=3:
+            if len(pltes)>0:
+                print(f"WARNING: there shouldn't be any PLTE chunks, {len(pltes)} found.")
         if new.ihdr.colortype==3:
-            _ = [chunk for chunk in new.chunks if chunk.type==b'PLTE']
-            if len(_)>1:
-                print("WARNING: there should only be 1 PLTE chunk, {} found.".format(len(_)))
+            if len(pltes)>1:
+                print("WARNING: there should only be 1 PLTE chunk, {} found.".format(len(pltes)))
                 return new
-            new.plte, *_ = _
+            new.plte, *_ = pltes
             new.pixels = [new.plte[x] for x in new.pixels]
         return new
 
@@ -365,7 +369,7 @@ class PNG():
         else:
             chunks = [self.chunks[0]]
 
-        if filtermethod == None:
+        if filtermethod is None:
             filtermethod = cycle((0,))
         data = apply_filter(self.pixels, self.ihdr.width_bytes, self.ihdr.bytes_per_pixel, filtermethod)
         for chunk in group(zlib.compress(data, compression_level), 8192):
@@ -377,24 +381,29 @@ class PNG():
         chunks += [self.chunks[-1]]
         self.chunks = chunks
 
+    def to_bytes(self, strip=False, compress=True, recalculate_crc=True):
+        buf = self.MAGIC
+        for c in self.chunks:
+            buf += c.to_bytes(recalculate_crc)
+        return buf
+
     def save(self, name, strip=False, compress=True, recalculate_crc=True):
         """
         write PNG to file
         changes made to the pixel data will only be saved if rebuild_chunks was called
         """
-        buf = self.MAGIC
-        for c in self.chunks:
-            buf += c.to_bytes(recalculate_crc)
         with open(name, "wb") as f:
-            return f.write(buf)
-
+            return f.write(self.to_bytes(strip, compress, recalculate_crc))
+    
 
 if __name__=='__main__':
     import sys
     try:
-        _, source, target = sys.argv
+        # ~ _, source, target = sys.argv
+        # ~ img = PNG.from_file(source)
+        # ~ img.rebuild_chunks()
+        # ~ img.save(target)
+        _, source = sys.argv
         img = PNG.from_file(source)
-        img.rebuild_chunks()
-        img.save(target)
     except ValueError:
         pass
