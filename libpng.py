@@ -5,6 +5,7 @@ from zlib import crc32
 
 from collections import deque
 from itertools import cycle
+from enum import IntEnum
 
 class Chunk():
     @classmethod
@@ -16,6 +17,14 @@ class Chunk():
         new.body = buf[8:8+length]
         new.crc = struct.unpack(">I", buf[8+length:8+length+4])[0]
         new.valid = new.crc == crc32(new.type+new.body)
+        return new
+    
+    @classmethod
+    def create(cls, ctype, body):
+        new = cls()
+        new.type = ctype
+        new.body = body
+        new.crc = crc32(new.type+new.body)
         return new
 
     def total(self):
@@ -37,8 +46,9 @@ class Chunk():
             buf += struct.pack(">I", self.crc)
         return buf
 
+IEND = Chunk.create(b'IEND', b'')
 
-def _parse_chunks(s):
+def parse_chunks(s):
     """parse bytes to list of Chunks"""
     i = 0
     chunks = []
@@ -52,14 +62,14 @@ def _parse_chunks(s):
             return chunks, s[i:]
         chunks.append(c)
         i += c.total()
-        if c.type==b'IEND':
+        if c.type == b'IEND':
             if i<len(s):
                 print("WARNING: Orphan data after IEND chunk")
                 return chunks, s[i:]
     return chunks, None
 
 def bits_to_bytes(x):
-    return (x>>3) + ((x&7)>0)
+    return (x >> 3) + ((x & 7) > 0)
 
 _bits_per_pixel = {}
 _bits_per_pixel[0] = {1:1, 2:2, 4:4, 8:8, 16:16}
@@ -68,9 +78,17 @@ _bits_per_pixel[3] = {1:1, 2:2, 4:4, 8:8}
 _bits_per_pixel[4] = {8:16, 16:32}
 _bits_per_pixel[6] = {8:32, 16:64}
 
+class ColorType(IntEnum):
+    GRAYSCALE = 0
+    RGB = 2
+    PALETTE = 3
+    GRAYSCALE_ALPHA = 4
+    RGBA = 6
+    
+
 class IHDR():
     @classmethod
-    def create(cls, width, height, bitdepth, colortype, compression, filtermethod, interlace):
+    def create(cls, width, height, bitdepth, colortype, compression=0, filtermethod=0, interlace=0):
         new = cls()
         new.width = width
         new.height = height
@@ -83,32 +101,37 @@ class IHDR():
         assert new.height>0, "ERROR: height must be positive"
         assert new.colortype in set([0, 2, 3, 4, 6]), "ERROR: {} is not a valid colortype".format(new.colortype)
         if new.colortype == 0:
-            assert new.bitdepth in set([1,2,4,8,16]), "ERROR: {} is not a valid bitdepth for colortype {}".format(new.bitdepth, new.colortype)
+            assert new.bitdepth in set([1,2,4,8,16]), "ERROR: {} is not a valid bitdepth for colortype {}".format(new.bitdepth, ColorType(new.colortype).name)
         elif new.colortype == 2:
-            assert new.bitdepth in set([8,16]), "ERROR: {} is not a valid bitdepth for colortype {}".format(new.bitdepth, new.colortype)
+            assert new.bitdepth in set([8,16]), "ERROR: {} is not a valid bitdepth for colortype {}".format(new.bitdepth, ColorType(new.colortype).name)
         elif new.colortype == 3:
-            assert new.bitdepth in set([1,2,4,8]), "ERROR: {} is not a valid bitdepth for colortype {}".format(new.bitdepth, new.colortype)
+            assert new.bitdepth in set([1,2,4,8]), "ERROR: {} is not a valid bitdepth for colortype {}".format(new.bitdepth, ColorType(new.colortype).name)
         elif new.colortype == 4:
-            assert new.bitdepth in set([8,16]), "ERROR: {} is not a valid bitdepth for colortype {}".format(new.bitdepth, new.colortype)
+            assert new.bitdepth in set([8,16]), "ERROR: {} is not a valid bitdepth for colortype {}".format(new.bitdepth, ColorType(new.colortype).name)
         elif new.colortype == 6:
-            assert new.bitdepth in set([8,16]), "ERROR: {} is not a valid bitdepth for colortype {}".format(new.bitdepth, new.colortype)
+            assert new.bitdepth in set([8,16]), "ERROR: {} is not a valid bitdepth for colortype {}".format(new.bitdepth, ColorType(new.colortype).name)
         assert new.compression==0, "ERROR: {} is not a valid compression type".format(new.compression)
         assert new.filtermethod==0, "ERROR: {} is not a valid filter method".format(new.filtermethod)
         assert new.interlace in set([0, 1]), "ERROR: {} is not a valid interlace method".format(new.interlace)
         new.bytes_per_pixel = bits_to_bytes(_bits_per_pixel[new.colortype][new.bitdepth])
-        new.width_bytes = bits_to_bytes(new.width*_bits_per_pixel[new.colortype][new.bitdepth])
+        new.width_bytes = bits_to_bytes(new.width * _bits_per_pixel[new.colortype][new.bitdepth])
         return new
 
     @classmethod
     def from_buffer(cls, buf):
-        assert len(buf) == struct.calcsize(">IIBBBBB"), "IHDR too large?"
+        length, expected = len(buf), struct.calcsize(">IIBBBBB")
+        if length > expected:
+            print(f"WARNING: IHDR too large? (found: {length}, expected: {expected})")
+            raise ValueError
+        elif length < expected:
+            print(f"ERROR: IHDR too small? (found: {length}, expected: {expected})")
+            raise ValueError
         width, height, bitdepth, colortype, compression, filtermethod, interlace = struct.unpack(">IIBBBBB", buf)
         new = cls.create(width, height, bitdepth, colortype, compression, filtermethod, interlace)
         return new
 
     def __repr__(self):
-        ctype = {0:'grayscale', 2:'RGB', 3:'palette', 4:'grayscale-alpha', 6:'RGBA'}
-        data = [("width", self.width), ("height", self.height), ("bitdepth", self.bitdepth), ("colortype", ctype[self.colortype]), ("compression", self.compression), ("filtermethod", self.filtermethod), ("interlace", self.interlace)]
+        data = [("width", self.width), ("height", self.height), ("bitdepth", self.bitdepth), ("colortype", ColorType(self.colortype).name), ("compression", self.compression), ("filtermethod", self.filtermethod), ("interlace", self.interlace)]
         return '\n'.join("{} : {}".format(y, x) for x, y in data)
 
     def to_chunk(self):
@@ -131,29 +154,29 @@ def split_to_chunks(data, size):
     for i in range(0, len(data), size):
         c = Chunk()
         c.type = b"IDAT"
-        c.body = data[i:min(i+size, len(data))]
+        c.body = data[i:min(i + size, len(data))]
         out.append(c)
     return out
 
-def restore_from_filter(pixels, width, bytes_per_pixel):
+def restore_from_filter(pixels, width, bytes_per_pixel, prev=None):
     def filter_sub(line):
         old = deque(0 for _ in range(bytes_per_pixel))
         out = []
         for b in line:
-            new = (b+old.pop())&0xff
+            new = (b + old.pop()) & 0xff
             out += [new]
             old.appendleft(new)
         out = bytes(out)
         return out
 
     def filter_up(line, prev):
-        return b''.join(bytes(((a+b)&0xff,)) for a, b in zip(line, prev))
+        return b''.join(bytes(((a + b) & 0xff,)) for a, b in zip(line, prev))
 
     def filter_avg(line, prev):
         out = []
         old = deque(0 for _ in range(bytes_per_pixel))
         for x, b in zip(line, prev):
-            out += [(x+(b+old.pop())//2)&0xff]
+            out += [(x + (b + old.pop()) // 2) & 0xff]
             old.appendleft(out[-1])
         return bytes(out)
 
@@ -174,14 +197,15 @@ def restore_from_filter(pixels, width, bytes_per_pixel):
                 rho = b
             else:
                 rho = c
-            out += bytes(((x + rho)&0xff,))
+            out += bytes(((x + rho) & 0xff,))
             old.appendleft(out[-1])
             old_up.appendleft(b)
         return out
 
     out = b""
-    prev = b"\x00"*width
-    for line in group(pixels, width+1):
+    if prev is None:
+        prev = b"\x00"*width
+    for line in group(pixels, width + 1):
         filter_type = line[0]
         if filter_type==0:
             cur = line[1:]
@@ -196,7 +220,7 @@ def restore_from_filter(pixels, width, bytes_per_pixel):
         else:
             print("ERROR: Invalid filter type {}".format(filter_type))
             raise ValueError
-        assert len(cur)==width, "missing some bytes"
+        assert len(cur)==width, f"missing {width - len(cur)} bytes"
         out += cur
         prev = cur
     return bytearray(out)
@@ -206,19 +230,19 @@ def apply_filter(pixels, width, bytes_per_pixel, method):
         old = deque(0 for _ in range(bytes_per_pixel))
         out = []
         for x in line:
-            new = (x - old.pop())%256
+            new = (x - old.pop()) & 0xff
             out.append(new)
             old.appendleft(x)
         return bytes(out)
 
     def filter_up(line, prev):
-        return bytes([(x-y)%256 for x, y in zip(line, prev)])
+        return bytes([(x - y) & 0xff for x, y in zip(line, prev)])
 
     def filter_avg(line, prev):
         out = []
         old = deque(0 for _ in range(bytes_per_pixel))
         for x, b in zip(line, prev):
-            out += [(x-(b+old.pop())//2)&0xff]
+            out += [(x - (b + old.pop()) // 2) & 0xff]
             old.appendleft(x)
         return bytes(out)
 
@@ -233,20 +257,20 @@ def apply_filter(pixels, width, bytes_per_pixel, method):
             pa = abs(p - a)
             pb = abs(p - b)
             pc = abs(p - c)
-            if pa<=pb and pa<=pc:
+            if pa <= pb and pa <= pc:
                 rho = a
-            elif pb<=pc:
+            elif pb <= pc:
                 rho = b
             else:
                 rho = c
-            new = (x-rho)%256
+            new = (x - rho) & 0xff
             out.append(new)
             old.appendleft(x)
             old_up.appendleft(b)
         return bytes(out)
 
     out = b""
-    prev = b"\x00"*width
+    prev = b"\x00" * width
     for switch, line in zip(method, group(pixels, width)):
         if switch==0:
             cur = b'\x00' + line
@@ -269,53 +293,44 @@ def read_nth(seq, n, offset=0):
     for i in range(offset, len(seq), n):
         yield seq[i]
 
-def _merge_data(chunks):
+def merge_data(chunks):
     """concat content of all chunks of type IDAT"""
-    return b''.join(chunk.body for chunk in chunks if chunk.type==b'IDAT')
+    return b''.join(chunk.body for chunk in chunks if chunk.type == b'IDAT')
 
 class PNG():
     MAGIC = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a"
-
+    
     @classmethod
-    def from_buffer(cls, buf, just_header=False):
-        """interpret content of buffer as PNG image"""
+    def from_chunks(cls, chunks, ihdr=None):
         new = cls()
-        assert len(cls.MAGIC) + 12 < len(buf), "ERROR: buffer too short"
-        assert buf[:len(cls.MAGIC)]==cls.MAGIC, "ERROR: magic bytes mismatched"
-
-        new.chunks, new.orphan = _parse_chunks(buf[len(cls.MAGIC):])
-
-        assert new.chunks[0].type == b'IHDR', "ERROR: first chunk must be of type IHDR, {} type chunk found".format(new.chunks[0].type)
-        count = sum(chunk.type==b'IHDR' for chunk in new.chunks)
-        assert count==1, "ERROR: there must be exactly 1 IHDR chunk, found {}".format(count)
-        if new.chunks[-1].type != b'IEND':
-             print("ERROR: last chunk must be of type IEND, {} type chunk found".format(new.chunks[-1].type))
-        count = sum(chunk.type==b'IEND' for chunk in new.chunks)
-        if count!=1:
-            print("ERROR: there must be exactly 1 IEND chunk, found {}".format(count))
-
-        try:
-            new.ihdr = IHDR.from_buffer(new.chunks[0].body)
-        except AssertionError as e:
-            print(e)
-            return new
-
-        # ~ if new.ihdr.colortype==3:
-            # ~ print("Color Type 3 is currently not supported")
-            # ~ return new
+        new.chunks = chunks
+        if ihdr is None:
+            try:
+                ihdr, *_ = new.get_chunks_by_type(b'IHDR')
+            except ValueError:
+                print("ERROR: Please supply a IHDR chunk")
+            if len(_) > 0:
+                print("WARNING: Multiple IHDR chunks found, used first")
+            new.ihdr = IHDR.from_buffer(ihdr.body)
+        else:
+            new.ihdr = ihdr
+            new.chunks = [ihdr.to_chunk()] + chunks
+            if len(new.get_chunks_by_type(b'IHDR')) > 1:
+                print("WARNING: Multiple IHDR chunks found, used the selected one")
+        iend_chunks = new.get_chunks_by_type(b'IEND')
+        if len(iend_chunks)==0:
+            print("INFO: autogenerated IEND chunk")
+            new.chunks.append(IEND)
+        elif len(iend_chunks)>1:
+            print(f"ERROR: there must be exactly one IEND chunk, but found {len(iend_chunks)}")
         if new.ihdr.interlace:
-            print("adam7 interlacing is currently not supported")
+            print("ERROR: adam7 interlacing is currently not supported")
             return new
-
-        if just_header:
-            return new
-
         try:
-            new.data = zlib.decompress(_merge_data(new.chunks))
+            new.data = zlib.decompress(merge_data(new.chunks))
         except zlib.error:
             print("ERROR: zlib.decompress failed")
             return new
-
         actual_dim, supposed_dim = len(new.data), new.ihdr.width*new.ihdr.height*new.ihdr.bytes_per_pixel+new.ihdr.height
         if actual_dim>supposed_dim:
             print("WARNING: too many pixels")
@@ -333,18 +348,40 @@ class PNG():
             print(e)
         except ValueError as e:
             pass
-        pltes = [chunk for chunk in new.chunks if chunk.type==b'PLTE']
-        if new.ihdr.colortype!=3:
-            if len(pltes)>0:
+        pltes = new.get_chunks_by_type(b'PLTE')
+        if new.ihdr.colortype != 3:
+            if len(pltes) > 0:
                 print(f"WARNING: there shouldn't be any PLTE chunks, {len(pltes)} found.")
-        if new.ihdr.colortype==3:
-            if len(pltes)>1:
+        elif new.ihdr.colortype == 3:
+            if len(pltes) > 1:
                 print("WARNING: there should only be 1 PLTE chunk, {} found.".format(len(pltes)))
                 return new
             new.plte, *_ = pltes
-            new.pixels = [new.plte[x] for x in new.pixels]
+            new.pixels = [new.plte.body[x] for x in new.pixels]
         return new
+        
+    @classmethod
+    def from_buffer(cls, buf, just_header=False):
+        """interpret content of buffer as PNG image"""
+        assert len(cls.MAGIC) + 12 < len(buf), "ERROR: buffer too short"
+        if buf[:len(cls.MAGIC)] != cls.MAGIC:
+            print("ERROR: magic bytes mismatched")
 
+        chunks, orphan = parse_chunks(buf[len(cls.MAGIC):])
+
+        if chunks[0].type != b'IHDR':
+            print("ERROR: first chunk must be of type IHDR, {} type chunk found".format(chunks[0].type))
+        count = sum(chunk.type==b'IHDR' for chunk in chunks)
+        if count > 1:
+            print("ERROR: there must be exactly 1 IHDR chunk, found {}".format(count))
+        if chunks[-1].type != b'IEND':
+             print("ERROR: last chunk must be of type IEND, {} type chunk found".format(chunks[-1].type))
+        count = sum(chunk.type==b'IEND' for chunk in chunks)
+        if count!=1:
+            print("ERROR: there must be exactly 1 IEND chunk, found {}".format(count))
+
+        return cls.from_chunks(chunks)
+        
     @classmethod
     def from_file(cls, name, just_header=False):
         """read file as a PNG image"""
@@ -355,8 +392,8 @@ class PNG():
         assert self.ihdr.interlace==0, "ERROR: can't deal with adam7 yet"
         return self.data[::self.ihdr.width*self.ihdr.bytes_per_pixel+1]
 
-    def get_chunks_by_type(self, type):
-        return [chunk for chunk in self.chunks if chunk.type==type]
+    def get_chunks_by_type(self, ctype):
+        return [chunk for chunk in self.chunks if chunk.type == ctype]
 
     def rebuild_chunks(self, filtermethod=None, update_ihdr=True, compression_level=9):
         """
