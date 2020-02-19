@@ -25,6 +25,7 @@ class Chunk():
         new.type = ctype
         new.body = body
         new.crc = crc32(new.type+new.body)
+        new.valid = True
         return new
 
     def total(self):
@@ -46,7 +47,20 @@ class Chunk():
             buf += struct.pack(">I", self.crc)
         return buf
 
+def create_comment(text, tag='Comment', compressed = False):
+    body = b''
+    body += tag.encode('ascii') + b'\x00'
+    if compressed:
+        ctype = b'zTXt'
+        body += text.encode('ascii')
+    else:
+        ctype = b'tEXt'
+        body += b'\x00' + zlib.compress(text.encode('ascii'), 9)
+    return Chunk.create(ctype, body)
+
 IEND = Chunk.create(b'IEND', b'')
+
+CRITICAL_CHUNK_TYPES = [b'IHDR', b'PLTE', b'IDAT', b'IEND']
 
 def parse_chunks(s):
     """parse bytes to list of Chunks"""
@@ -56,7 +70,10 @@ def parse_chunks(s):
         try:
             c = Chunk.from_buffer(s[i:])
             if not c.valid:
-                print(i)
+                print(f"WARNING: chunk {i} checksum failed")
+            if c.type[0]&(1<<5) == 0:
+                if not c.type in CRITICAL_CHUNK_TYPES:
+                    print(f"ERROR: chunk {i} of type {c.type} cannot be interpreted")
         except struct.error:
             print("WARNING: Orphan data after IEND")
             return chunks, s[i:]
@@ -131,7 +148,7 @@ class IHDR():
         return new
 
     def __repr__(self):
-        data = [("width", self.width), ("height", self.height), ("bitdepth", self.bitdepth), ("colortype", ColorType(self.colortype).name), ("compression", self.compression), ("filtermethod", self.filtermethod), ("interlace", self.interlace)]
+        data = [("width", self.width), ("height", self.height), ("bitdepth", self.bitdepth), ("colortype", ColorType(self.colortype).name), ("compression", self.compression), ("filtermethod", self.filtermethod), ("interlace", ["false", "adam7"][self.interlace])]
         return '\n'.join("{} : {}".format(y, x) for x, y in data)
 
     def to_chunk(self):
@@ -158,136 +175,144 @@ def split_to_chunks(data, size):
         out.append(c)
     return out
 
-def restore_from_filter(pixels, width, bytes_per_pixel, prev=None):
-    def filter_sub(line):
-        old = deque(0 for _ in range(bytes_per_pixel))
-        out = []
-        for b in line:
-            new = (b + old.pop()) & 0xff
-            out += [new]
-            old.appendleft(new)
-        out = bytes(out)
-        return out
+class FilterType(IntEnum):
+    NONE = 0
+    SUB = 1
+    UP = 2
+    AVG = 3
+    PAETH = 4
 
-    def filter_up(line, prev):
-        return b''.join(bytes(((a + b) & 0xff,)) for a, b in zip(line, prev))
+def undo_sub(scanline, bytes_per_pixel):
+    old = deque([0] * bytes_per_pixel)
+    out = []
+    for b in scanline:
+        new = (b + old.pop()) & 0xff
+        out.append(new)
+        old.appendleft(new)
+    return bytes(out)
 
-    def filter_avg(line, prev):
-        out = []
-        old = deque(0 for _ in range(bytes_per_pixel))
-        for x, b in zip(line, prev):
-            out += [(x + (b + old.pop()) // 2) & 0xff]
-            old.appendleft(out[-1])
-        return bytes(out)
+def undo_up(scanline, prev, bytes_per_pixel):
+    return bytes((x + b) & 0xff for x, b in zip(scanline, prev))
 
-    def filter_paeth(line, prev):
-        out = b''
-        old = deque(0 for _ in range(bytes_per_pixel))
-        old_up = deque(0 for _ in range(bytes_per_pixel))
-        for x, b in zip(line, prev):
-            a = old.pop()
-            c = old_up.pop()
-            p = a + b - c
-            pa = abs(p - a)
-            pb = abs(p - b)
-            pc = abs(p - c)
-            if pa <= pb and pa <= pc:
-                rho = a
-            elif pb <= pc:
-                rho = b
-            else:
-                rho = c
-            out += bytes(((x + rho) & 0xff,))
-            old.appendleft(out[-1])
-            old_up.appendleft(b)
-        return out
+def undo_avg(scanline, prev, bytes_per_pixel):
+    out = []
+    old = deque([0] * bytes_per_pixel)
+    for x, b in zip(scanline, prev):
+        new = (x + (b + old.pop()) // 2) & 0xff
+        out.append(new)
+        old.appendleft(new)
+    return bytes(out)
 
-    out = b""
-    if prev is None:
-        prev = b"\x00"*width
-    for line in group(pixels, width + 1):
-        filter_type = line[0]
-        if filter_type==0:
-            cur = line[1:]
-        elif filter_type==1:
-            cur = filter_sub(line[1:])
-        elif filter_type==2:
-            cur = filter_up(line[1:], prev)
-        elif filter_type==3:
-            cur = filter_avg(line[1:], prev)
-        elif filter_type==4:
-            cur = filter_paeth(line[1:], prev)
+def undo_paeth(scanline, prev, bytes_per_pixel):
+    out = []
+    old = deque([0] * bytes_per_pixel)
+    old_up = deque([0] * bytes_per_pixel)
+    for x, b in zip(scanline, prev):
+        a = old.pop()
+        c = old_up.pop()
+        p = a + b - c
+        pa = abs(p - a)
+        pb = abs(p - b)
+        pc = abs(p - c)
+        if pa <= pb and pa <= pc:
+            rho = a
+        elif pb <= pc:
+            rho = b
         else:
-            print("ERROR: Invalid filter type {}".format(filter_type))
+            rho = c
+        new = (x + rho) & 0xff
+        out.append(new)
+        old.appendleft(new)
+        old_up.appendleft(b)
+    return bytes(out)
+
+def undo_filter(pixels, width, bytes_per_pixel):
+    out = b''
+    prev = bytes([0] * width)
+    for row in group(pixels, width + 1):
+        filter_type, *scanline = row
+        if filter_type == FilterType.NONE:
+            cur = bytes(scanline)
+        elif filter_type == FilterType.SUB:
+            cur = undo_sub(scanline, bytes_per_pixel)
+        elif filter_type == FilterType.UP:
+            cur = undo_up(scanline, prev, bytes_per_pixel)
+        elif filter_type == FilterType.AVG:
+            cur = undo_avg(scanline, prev, bytes_per_pixel)
+        elif filter_type == FilterType.PAETH:
+            cur = undo_paeth(scanline, prev, bytes_per_pixel)
+        else:
+            print(f"ERROR: Invalid filter type {filter_type}")
             raise ValueError
-        assert len(cur)==width, f"missing {width - len(cur)} bytes"
+        assert len(cur) == width, f"ERROR: scanline wrong, is {len(cur)} should be {width}"
         out += cur
         prev = cur
     return bytearray(out)
 
-def apply_filter(pixels, width, bytes_per_pixel, method):
-    def filter_sub(line):
-        old = deque(0 for _ in range(bytes_per_pixel))
-        out = []
-        for x in line:
-            new = (x - old.pop()) & 0xff
-            out.append(new)
-            old.appendleft(x)
-        return bytes(out)
+def apply_sub(scanline, bytes_per_pixel):
+    old = deque([0] * bytes_per_pixel)
+    out = []
+    for x in scanline:
+        new = (x - old.pop()) & 0xff
+        out.append(new)
+        old.appendleft(new)
+    return bytes(out)
 
-    def filter_up(line, prev):
-        return bytes([(x - y) & 0xff for x, y in zip(line, prev)])
+def apply_up(scanline, prev, bytes_per_pixel):
+    return bytes((x - b) & 0xff for x, b in zip(scanline, prev))
 
-    def filter_avg(line, prev):
-        out = []
-        old = deque(0 for _ in range(bytes_per_pixel))
-        for x, b in zip(line, prev):
-            out += [(x - (b + old.pop()) // 2) & 0xff]
-            old.appendleft(x)
-        return bytes(out)
+def apply_avg(scanline, prev, bytes_per_pixel):
+    out = []
+    old = deque([0] * bytes_per_pixel)
+    for x, b in zip(scanline, prev):
+        new = (x - (b + old.pop()) // 2) & 0xff
+        out.append(new)
+        old.appendleft(new)
+    return bytes(out)
 
-    def filter_paeth(line, prev):
-        out = []
-        old = deque(0 for _ in range(bytes_per_pixel))
-        old_up = deque(0 for _ in range(bytes_per_pixel))
-        for x, b in zip(line, prev):
-            a = old.pop()
-            c = old_up.pop()
-            p = a + b - c
-            pa = abs(p - a)
-            pb = abs(p - b)
-            pc = abs(p - c)
-            if pa <= pb and pa <= pc:
-                rho = a
-            elif pb <= pc:
-                rho = b
-            else:
-                rho = c
-            new = (x - rho) & 0xff
-            out.append(new)
-            old.appendleft(x)
-            old_up.appendleft(b)
-        return bytes(out)
-
-    out = b""
-    prev = b"\x00" * width
-    for switch, line in zip(method, group(pixels, width)):
-        if switch==0:
-            cur = b'\x00' + line
-        elif switch==1:
-            cur = b'\x01' + filter_sub(line)
-        elif switch==2:
-            cur = b'\x02' + filter_up(line, prev)
-        elif switch==3:
-            cur = b'\x03' + filter_avg(line, prev)
-        elif switch==4:
-            cur = b'\x04' + filter_paeth(line, prev)
+def apply_paeth(scanline, prev, bytes_per_pixel):
+    out = []
+    old = deque([0] * bytes_per_pixel)
+    old_up = deque([0] * bytes_per_pixel)
+    for x, b in zip(scanline, prev):
+        a = old.pop()
+        c = old.pop()
+        p = a + b - c
+        pa = abs(p - a)
+        pb = abs(p - b)
+        pc = abs(p - c)
+        if pa <= pb and pa <= pc:
+            rho = a
+        elif pb <= pc:
+            rho = b
         else:
-            print("ERROR: invalid filter type {}".format(method))
+            rho = c
+        new = (x - rho) & 0xff
+        out.append(new)
+        old.appendleft(new)
+        old_up.appendleft(b)
+    return bytes(out)
+
+def apply_filter(pixels, width, bytes_per_pixel, method):
+    out = b''
+    prev = bytes([0] * width)
+    for filter_type, scanline in zip(method, group(pixels, width)):
+        if filter_type == FilterType.NONE:
+            cur = scanline
+        elif filter_type == FilterType.SUB:
+            cur = apply_sub(scanline, bytes_per_pixel)
+        elif filter_type == FilterType.UP:
+            cur = apply_up(scanline, prev, bytes_per_pixel)
+        elif filter_type == FilterType.AVG:
+            cur = apply_avg(scanline, prev, bytes_per_pixel)
+        elif filter_type == FilterType.PAETH:
+            cur = apply_paeth(scanline, prev, bytes_per_pixel)
+        else:
+            print(f"ERROR: Invalid filter type {filter_type}")
             raise ValueError
-        out += cur
-        prev = line
-    return out
+        row = b'{:d}{}'.format(filter_type, cur)
+        out += row
+        prev = row
 
 def read_nth(seq, n, offset=0):
     for i in range(offset, len(seq), n):
@@ -297,13 +322,20 @@ def merge_data(chunks):
     """concat content of all chunks of type IDAT"""
     return b''.join(chunk.body for chunk in chunks if chunk.type == b'IDAT')
 
+def decompress(data):
+    D = zlib.decompressobj()
+    data = D.decompress(data)
+    return data, D.unused_data
+
 class PNG():
     MAGIC = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a"
     
     @classmethod
-    def from_chunks(cls, chunks, ihdr=None):
+    def from_chunks(cls, chunks, ihdr=None, orphan=None):
         new = cls()
         new.chunks = chunks
+        if not orphan is None:
+            new.orphan = orphan
         if ihdr is None:
             try:
                 ihdr, *_ = new.get_chunks_by_type(b'IHDR')
@@ -323,14 +355,22 @@ class PNG():
             new.chunks.append(IEND)
         elif len(iend_chunks)>1:
             print(f"ERROR: there must be exactly one IEND chunk, but found {len(iend_chunks)}")
-        if new.ihdr.interlace:
-            print("ERROR: adam7 interlacing is currently not supported")
-            return new
+        elif len(iend_chunks[0].body) > 0:
+            print(f"ERROR: IEND chunk must be empty, found {len(iend_chunks[0].body)} bytes")
+
         try:
-            new.data = zlib.decompress(merge_data(new.chunks))
+            new.data, unused = decompress(merge_data(new.chunks))
+            if unused:
+                new.unused = unused
+                print(f"INFO: unused {len(unused)} bytes of data in IDAT")
         except zlib.error:
             print("ERROR: zlib.decompress failed")
             return new
+            
+        if new.ihdr.interlace:
+            print("ERROR: adam7 interlacing is currently not supported")
+            return new
+
         actual_dim, supposed_dim = len(new.data), new.ihdr.width*new.ihdr.height*new.ihdr.bytes_per_pixel+new.ihdr.height
         if actual_dim>supposed_dim:
             print("WARNING: too many pixels")
@@ -340,10 +380,13 @@ class PNG():
             print("ERROR: too few pixels")
             print("expected:\n\t{}x{}x{} = {}".format(new.ihdr.width, new.ihdr.height, new.ihdr.bytes_per_pixel, supposed_dim))
             print("found:\n\t{}".format(actual_dim))
-            raise ValueError
+            if False:
+                raise ValueError
+            else:
+                new.data += (supposed_dim - actual_dim) * b'\x00'
 
         try:
-            new.pixels = restore_from_filter(new.data, new.ihdr.width_bytes, new.ihdr.bytes_per_pixel)
+            new.pixels = undo_filter(new.data, new.ihdr.width_bytes, new.ihdr.bytes_per_pixel)
         except AssertionError as e:
             print(e)
         except ValueError as e:
@@ -366,7 +409,8 @@ class PNG():
         assert len(cls.MAGIC) + 12 < len(buf), "ERROR: buffer too short"
         if buf[:len(cls.MAGIC)] != cls.MAGIC:
             print("ERROR: magic bytes mismatched")
-
+        
+        orphan = None
         chunks, orphan = parse_chunks(buf[len(cls.MAGIC):])
 
         if chunks[0].type != b'IHDR':
@@ -380,7 +424,7 @@ class PNG():
         if count!=1:
             print("ERROR: there must be exactly 1 IEND chunk, found {}".format(count))
 
-        return cls.from_chunks(chunks)
+        return cls.from_chunks(chunks, orphan = orphan)
         
     @classmethod
     def from_file(cls, name, just_header=False):
@@ -389,7 +433,9 @@ class PNG():
             return cls.from_buffer(f.read(), just_header)
 
     def get_filter_bytes(self):
-        assert self.ihdr.interlace==0, "ERROR: can't deal with adam7 yet"
+        if self.ihdr.interlace!=0:
+            print("ERROR: can't deal with adam7 yet")
+            raise NotImplemented
         return self.data[::self.ihdr.width*self.ihdr.bytes_per_pixel+1]
 
     def get_chunks_by_type(self, ctype):
@@ -407,15 +453,16 @@ class PNG():
             chunks = [self.chunks[0]]
 
         if filtermethod is None:
-            filtermethod = cycle((0,))
-        data = apply_filter(self.pixels, self.ihdr.width_bytes, self.ihdr.bytes_per_pixel, filtermethod)
+            if filtermethod is None:
+                filtermethod = cycle((0,))
+            self.data = apply_filter(self.pixels, self.ihdr.width_bytes, self.ihdr.bytes_per_pixel, filtermethod)
         for chunk in group(zlib.compress(data, compression_level), 8192):
             c = Chunk()
             c.type = b"IDAT"
             c.body = chunk
             chunks.append(c)
 
-        chunks += [self.chunks[-1]]
+        chunks += [IEND]
         self.chunks = chunks
 
     def to_bytes(self, strip=False, compress=True, recalculate_crc=True):
@@ -436,10 +483,6 @@ class PNG():
 if __name__=='__main__':
     import sys
     try:
-        # ~ _, source, target = sys.argv
-        # ~ img = PNG.from_file(source)
-        # ~ img.rebuild_chunks()
-        # ~ img.save(target)
         _, source = sys.argv
         img = PNG.from_file(source)
     except ValueError:
